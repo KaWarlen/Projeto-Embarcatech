@@ -49,7 +49,8 @@ target_link_libraries(Projeto_Embarca
     pico_stdlib
     hardware_adc
     hardware_i2c
-    hardware_gpio)
+    hardware_gpio
+    hardware_pwm)
 
 # Add the standard include files to the build
 target_include_directories(Projeto_Embarca PRIVATE

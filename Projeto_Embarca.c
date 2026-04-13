@@ -6,6 +6,7 @@
 #include "hardware/adc.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/pwm.h"
 
 #define I2C_PORT i2c1
 #define I2C_SDA_PIN 14
@@ -17,6 +18,7 @@
 #define JOY_Y_ADC_CH 1
 #define JOY_X_PIN 26
 #define JOY_Y_PIN 27
+#define JOY_SW_PIN 22
 
 #define OLED_W 128
 #define OLED_H 64
@@ -30,6 +32,14 @@
 #define JOY_DEADZONE 700
 #define JOY_SAMPLE_MS 25
 #define GAME_TICK_MS 140
+
+#define BUZZER_PIN 21
+#define BUZZER_PWM_DIV 4
+#define BUZZER_EAT_FREQ_HZ 2400
+#define BUZZER_EAT_MS 60
+#define BUZZER_GAME_OVER_FREQ_HZ 500
+#define BUZZER_GAME_OVER_MS 300
+#define BUTTON_DEBOUNCE_US 200000
 
 typedef struct {
     uint8_t x;
@@ -63,8 +73,18 @@ typedef struct {
     uint32_t score;
 } GameState;
 
+typedef struct {
+    uint slice;
+    uint channel;
+    bool active;
+    absolute_time_t off_time;
+} BuzzerState;
+
  GameState game;
  uint8_t oled_buffer[OLED_W * OLED_H / 8];
+ BuzzerState buzzer;
+ volatile bool restart_requested = false;
+ volatile uint32_t last_button_irq_us = 0;
 
 //Maquina de estado pra impedir a cobra de se churrascar a linha é a direção atual da cobra e a coluna é o input do joystick
  const Direction dir_fsm[4][5] = {
@@ -109,6 +129,61 @@ typedef struct {
     ssd1306_cmd(0x8D);
     ssd1306_cmd(0x14);
     ssd1306_cmd(0xAF);
+}
+
+ void buzzer_init(void) {
+    gpio_set_function(BUZZER_PIN, GPIO_FUNC_PWM);
+    buzzer.slice = pwm_gpio_to_slice_num(BUZZER_PIN);
+    buzzer.channel = pwm_gpio_to_channel(BUZZER_PIN);
+    buzzer.active = false;
+    pwm_set_enabled(buzzer.slice, false);
+}
+
+ void buzzer_play(uint32_t freq_hz, uint32_t duration_ms) {
+    if (freq_hz == 0 || duration_ms == 0) {
+        return;
+    }
+
+    uint32_t top = (125000000u / (BUZZER_PWM_DIV * freq_hz)) - 1u;
+    if (top > 65534u) {
+        top = 65534u;
+    }
+    if (top < 20u) {
+        top = 20u;
+    }
+
+    pwm_set_clkdiv_int_frac(buzzer.slice, BUZZER_PWM_DIV, 0);
+    pwm_set_wrap(buzzer.slice, (uint16_t)top);
+    pwm_set_chan_level(buzzer.slice, buzzer.channel, (uint16_t)(top / 2u));
+    pwm_set_enabled(buzzer.slice, true);
+
+    buzzer.active = true;
+    buzzer.off_time = delayed_by_ms(get_absolute_time(), duration_ms);
+}
+
+ void buzzer_update(void) {
+    if (!buzzer.active) {
+        return;
+    }
+
+    if (absolute_time_diff_us(get_absolute_time(), buzzer.off_time) <= 0) {
+        pwm_set_enabled(buzzer.slice, false);
+        buzzer.active = false;
+    }
+}
+
+ void joy_button_irq(uint gpio, uint32_t events) {
+    if (gpio != JOY_SW_PIN || (events & GPIO_IRQ_EDGE_FALL) == 0) {
+        return;
+    }
+
+    uint32_t now = time_us_32();
+    if ((now - last_button_irq_us) < BUTTON_DEBOUNCE_US) {
+        return;
+    }
+
+    last_button_irq_us = now;
+    restart_requested = true;
 }
 
 //Todo o buffer daa ram para a tela por meio do i2c, envia blocos de 16 bytes pra não estourar o pobre do 12c
@@ -405,6 +480,13 @@ typedef struct {
     adc_gpio_init(JOY_X_PIN);
     adc_gpio_init(JOY_Y_PIN);
 
+    gpio_init(JOY_SW_PIN);
+    gpio_set_dir(JOY_SW_PIN, GPIO_IN);
+    gpio_pull_up(JOY_SW_PIN);
+    gpio_set_irq_enabled_with_callback(JOY_SW_PIN, GPIO_IRQ_EDGE_FALL, true, &joy_button_irq);
+
+    buzzer_init();
+
     ssd1306_init();
 }
 
@@ -420,6 +502,17 @@ int main(void) {
     absolute_time_t next_input = delayed_by_ms(get_absolute_time(), JOY_SAMPLE_MS);
 
     while (true) {
+        buzzer_update();
+
+        if (restart_requested) {
+            restart_requested = false;
+            if (game.game_over) {
+                reset_game();
+                render_game();
+                buzzer_play(1600, 70);
+            }
+        }
+
         // Le o joystick a cada 25ms
         if (absolute_time_diff_us(get_absolute_time(), next_input) <= 0) {
             InputEvent evt = read_joystick_event();
@@ -429,7 +522,18 @@ int main(void) {
 
         //Atualiza o jogo e tela
         if (absolute_time_diff_us(get_absolute_time(), next_tick) <= 0) {
+            uint32_t prev_score = game.score;
+            bool was_game_over = game.game_over;
+
             game_tick();
+
+            if (game.score > prev_score) {
+                buzzer_play(BUZZER_EAT_FREQ_HZ, BUZZER_EAT_MS);
+            }
+            if (!was_game_over && game.game_over) {
+                buzzer_play(BUZZER_GAME_OVER_FREQ_HZ, BUZZER_GAME_OVER_MS);
+            }
+
             render_game();
             next_tick = delayed_by_ms(next_tick, GAME_TICK_MS);
         }
